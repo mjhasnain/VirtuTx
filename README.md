@@ -79,7 +79,7 @@ python evaluate_zero_shot.py
 # SCRIPT: validate_zeroshot.py
 # EXAMPLE COMMAND:
 
-python validate_zeroshot.py --gene GATA1 --cell_line K562 --output_dir ./validation_GATA1
+python validate_zeroshot.py --gene UPF3B  --cell_line K562 --output_dir ./validation_GATA1
 
 
 --------------------------------------------------------------------------------
