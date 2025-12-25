@@ -63,7 +63,7 @@ python train.py --output_dir ./final_model_run
  PART III: MODEL VALIDATION
 --------------------------------------------------------------------------------
 
-### STEP 5: QUANTITATIVE ZERO-SHOT EVALUATION
+### STEP 5A: QUANTITATIVE ZERO-SHOT EVALUATION
 
 # PURPOSE: To assess the model's performance across the entire test set
 #          using population-level metrics.
@@ -71,6 +71,13 @@ python train.py --output_dir ./final_model_run
 
 python evaluate_zero_shot.py
 
+### STEP 5A: QUANTITATIVE ZERO-SHOT EVALUATION On EXTERNAL DATASET
+
+# PURPOSE: To assess the model's performance across the entire external test set
+#          using population-level metrics.
+# SCRIPT: evaluate_zero_shot_norman.py
+
+python evaluate_zero_shot_norman.py
 
 ### STEP 6: DEEP QUALITATIVE ZERO-SHOT VALIDATION
 
@@ -142,27 +149,17 @@ python analyze_repurposing_screen.py \
 
 ### STEP 11: UNIFIED THERAPEUTIC SCREENING (MAIN APPLICATION)
 
-# PURPOSE: The final, full-service screening script to find candidates for BOTH
-#          synthetic lethality OR genetic rescue, with automated figure generation.
-# SCRIPT: run_lfc_screen_final.py
-# INSTRUCTIONS:
-#   - This is the recommended script for all final connectivity-based screening.
-#   - Ensure your GPU is specified, e.g., by setting CUDA_VISIBLE_DEVICES.
-#   - Choose 'lethality' or 'rescue' for the --screen_type argument.
+# PURPOSE: Gene-centric Synthetic Lethality Screening with VirtuTx
+# Uses target_gene column only — drug_name is ignored (can be anything).
+# Handles duplicate genes, flexible headers, and your exact file format.
 
 # EXAMPLE COMMAND FOR SYNTHETIC LETHALITY:
-CUDA_VISIBLE_DEVICES=0 python run_lfc_screen_final.py \
-  --disease_gene "TET2" \
-  --cell_line "K562" \
-  --screen_type "lethality" \
-  --output_dir "./TET2_lethality_results"
-
-# EXAMPLE COMMAND FOR GENETIC RESCUE:
-CUDA_VISIBLE_DEVICES=0 python run_lfc_screen_final.py \
-  --disease_gene "GATA1" \
-  --cell_line "K562" \
-  --screen_type "rescue" \
-  --output_dir "./GATA1_rescue_results"
+python synthetic_lethality_screen.py \
+    --disease_gene TET2 \
+    --cell_line K562 \
+    --target_list_csv drug_screen_experiments.csv \
+    --score_type combined \
+    --num_cells 2000
 
 # OUTPUT: The script will create the specified output directory and save the
 #         ranked results CSV file and two publication-quality figures inside it.
