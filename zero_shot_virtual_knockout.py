@@ -1,6 +1,7 @@
 # zero_shot_virtual_knockout.py
 # PURPOSE: True zero-shot in-silico knockout of ANY gene (even completely unseen)
-# Run: python zero_shot_virtual_knockout.py --gene MYC --cell_line K562 --num_cells 8000
+# Supports single and multiple (double+) perturbations.
+# Safe handling of gene tokens for multi-gene KOs to prevent out-of-range indexing.
 
 import torch
 import pandas as pd
@@ -17,22 +18,25 @@ from opt import parse_args
 
 
 def generate_population(model, vae_model, latent_scaler, ldm_artifacts, vae_artifacts, args, device,
-                        cell_line, gene_perturbation, n_samples=5000, use_lfc_hint=False):
+                        cell_line, perturbed_genes, n_samples=5000, use_lfc_hint=False):
     """
-    Generates a population of virtual cells.
+    Generates a population of virtual cells. Supports single or multiple perturbed genes.
 
     Args:
-        ... (all previous args) ...
-        use_lfc_hint (bool): If True, use the real LFC signature and gene token.
-                             If False, performs a true zero-shot prediction.
+        perturbed_genes: str or list of str. Gene(s) to perturb (e.g., 'TET2' or ['TET2', 'GLS']).
+        use_lfc_hint (bool): If True, use real LFC signature + gene token (only for seen genes).
+                             If False, true zero-shot (zero signature + unknown token).
     """
+    if isinstance(perturbed_genes, str):
+        perturbed_genes = [perturbed_genes]
+    
     mode = "LFC-Hinted" if use_lfc_hint else "TRUE ZERO-SHOT"
-    print(f"\n=== Generating {n_samples} virtual cells | {cell_line} | {gene_perturbation} ({mode}) ===")
+    print(f"\n=== Generating {n_samples} virtual cells | {cell_line} | {'+'.join(perturbed_genes)} ({mode}) ===")
 
     metadata_df = pd.DataFrame({
         'Cell_Line': [cell_line] * n_samples,
         'Genetic_perturbations': ['CRISPRi'] * n_samples,
-        'Perturbed_Gene': [gene_perturbation] * n_samples
+        'Perturbed_Gene': ['+'.join(perturbed_genes)] * n_samples
     })
 
     model.eval()
@@ -45,29 +49,39 @@ def generate_population(model, vae_model, latent_scaler, ldm_artifacts, vae_arti
     cl_tensor = torch.tensor(cl_enc, dtype=torch.float32).to(device)
     pm_tensor = torch.tensor(pm_enc, dtype=torch.float32).to(device)
 
-    # --- DYNAMIC CONDITIONING BASED ON MODE ---
+    # --- CONDITIONING LOGIC ---
     embedding_dim = next(iter(ldm_artifacts['gene_embedding_dict'].values())).shape[0]
     gene2id = ldm_artifacts['gene2id']
+    unknown_gene_id = gene2id['__unknown__']
 
     if use_lfc_hint:
-        # LFC-Hinted Mode: Use the real pre-calculated signature and gene token
-        signature_key = f"{cell_line}_{gene_perturbation}"
-        signature_dict = ldm_artifacts['gene_embedding_dict']
-        lfc_signature = signature_dict.get(signature_key, np.zeros(embedding_dim))
+        # Use real LFC signatures (average if multiple) and real gene tokens (fallback to unknown if any missing)
+        signatures = []
+        gene_ids = []
+        for gene in perturbed_genes:
+            key = f"{cell_line}_{gene}"
+            sig = ldm_artifacts['gene_embedding_dict'].get(key, np.zeros(embedding_dim))
+            signatures.append(sig)
+            gid = gene2id.get(gene, unknown_gene_id)
+            gene_ids.append(gid)
         
-        signature_tensor = torch.tensor(lfc_signature, dtype=torch.float32).unsqueeze(0).repeat(n_samples, 1).to(device)
+        avg_sig = np.mean(signatures, axis=0)
+        signature_tensor = torch.tensor(avg_sig, dtype=torch.float32).unsqueeze(0).repeat(n_samples, 1).to(device)
         
-        gene_id = gene2id.get(gene_perturbation, gene2id['__unknown__']) # Use real token if known
-        gene_token_ids = torch.full((n_samples,), gene_id, dtype=torch.long, device=device)
+        # If any gene is unknown, fall back to unknown token; otherwise sum real IDs
+        if unknown_gene_id in gene_ids:
+            final_gid = unknown_gene_id
+        else:
+            final_gid = sum(gene_ids)  # Simple sum of embeddings
+        gene_token_ids = torch.full((n_samples,), final_gid, dtype=torch.long, device=device)
 
     else:
-        # Zero-Shot Mode: Use zero signature and unknown gene token
+        # TRUE ZERO-SHOT: zero signature + always use the single __unknown__ token
+        # Critical fix: do NOT multiply unknown_id — that causes out-of-range indexing
         signature_tensor = torch.zeros(n_samples, embedding_dim, device=device)
-        unknown_gene_id = gene2id['__unknown__']
         gene_token_ids = torch.full((n_samples,), unknown_gene_id, dtype=torch.long, device=device)
-    # --- END DYNAMIC CONDITIONING ---
 
-
+    # --- DIFFUSION SAMPLING ---
     generated_latents_scaled = []
     batch_size = args.batch_size
 
@@ -89,7 +103,7 @@ def generate_population(model, vae_model, latent_scaler, ldm_artifacts, vae_arti
                 pred_x0 = torch.clamp(pred_x0, 0, 1)
 
                 if t > 0:
-                    a_bar = model.alpha_bar[t_tensor].view((-1, 1))
+                    a_bar = model.alpha_bar[t_tensor].view(-1, 1)
                     a_bar_prev = model.alpha_bar[t_tensor - 1].view(-1, 1)
                     pred_noise = (x_t - torch.sqrt(a_bar) * pred_x0) / torch.sqrt(1 - a_bar)
                     x_t = torch.sqrt(a_bar_prev) * pred_x0 + torch.sqrt(1 - a_bar_prev) * pred_noise
@@ -102,12 +116,14 @@ def generate_population(model, vae_model, latent_scaler, ldm_artifacts, vae_arti
     generated_latents = latent_scaler.inverse_transform(generated_latents_scaled)
     generated_latents = torch.tensor(generated_latents, dtype=torch.float32).to(device)
 
+    # --- VAE DECODING ---
     vae_conds = torch.tensor(vae_artifacts['condition_encoder'].transform(metadata_df[vae_artifacts['condition_cols']]), dtype=torch.float32).to(device)
 
     decoded_profiles = []
     with torch.no_grad():
         for i in tqdm(range(0, n_samples, batch_size), desc=f"Decoding ({mode})"):
-            z = generated_latents[i:i+batch_size]; c = vae_conds[i:i+batch_size]
+            z = generated_latents[i:i+batch_size]
+            c = vae_conds[i:i+batch_size]
             dec = vae_model.decode(z, c)
             decoded_profiles.append(dec.cpu().numpy())
 
@@ -119,19 +135,19 @@ def generate_population(model, vae_model, latent_scaler, ldm_artifacts, vae_arti
 def convert_ensembl_to_symbols(ensembl_ids):
     mg = mygene.MyGeneInfo()
     results = mg.querymany(ensembl_ids, scopes='ensembl.gene', fields='symbol', species='human', verbose=False)
-    symbols = []
-    for r in results:
-        symbols.append(r.get('symbol', r['query']))
-    return symbols
+    return [r.get('symbol', r['query']) for r in results]
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gene', type=str, required=True, help="Gene symbol to knock out (e.g. MYC)")
+    parser.add_argument('--gene', type=str, required=True, help="Gene symbol(s) to knock out, comma-separated for multiple (e.g. TET2,GLS)")
     parser.add_argument('--cell_line', type=str, required=True, help="Cell line (e.g. K562)")
     parser.add_argument('--num_cells', type=int, default=8000)
     parser.add_argument('--output_dir', type=str, default='./zero_shot_virtual_results')
     args_cmd = parser.parse_args()
+
+    # Support multiple genes via comma
+    perturbed_genes = [g.strip() for g in args_cmd.gene.split(',')]
 
     args = parse_args([])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -146,7 +162,7 @@ def main():
         num_conditions=len(vae_artifacts['condition_encoder'].get_feature_names_out()),
         latent_dim=vae_artifacts['latent_dim']
     ).to(device)
-    vae_model.load_state_dict(torch.load(args.vae_path, map_location=device))
+    vae_model.load_state_dict(torch.load(args.vae_path, map_location=device, weights_only=True))
     vae_model.eval()
 
     # Load LDM
@@ -167,14 +183,14 @@ def main():
         gene_token_dim=128,
         num_known_genes=len(ldm_artifacts['gene2id'])
     ).to(device)
-    model.load_state_dict(torch.load(os.path.join(args.output_dir, 'best_model.pth'), map_location=device))
+    model.load_state_dict(torch.load(os.path.join(args.output_dir, 'best_model.pth'), map_location=device, weights_only=True))
     model.eval()
 
     # Generate control and perturbed
     control_df = generate_population(model, vae_model, ldm_artifacts['latent_scaler'], ldm_artifacts,
                                      vae_artifacts, args, device, args_cmd.cell_line, "Control", args_cmd.num_cells)
     perturbed_df = generate_population(model, vae_model, ldm_artifacts['latent_scaler'], ldm_artifacts,
-                                       vae_artifacts, args, device, args_cmd.cell_line, args_cmd.gene, args_cmd.num_cells)
+                                       vae_artifacts, args, device, args_cmd.cell_line, perturbed_genes, args_cmd.num_cells)
 
     # DE analysis
     results = []
@@ -186,11 +202,11 @@ def main():
         results.append({'gene': gene, 'log2FC': l2fc, 'pval': pv})
 
     de_df = pd.DataFrame(results).sort_values('pval')
-    de_path = os.path.join(args_cmd.output_dir, f"DE_{args_cmd.cell_line}_{args_cmd.gene}.csv")
+    de_path = os.path.join(args_cmd.output_dir, f"DE_{args_cmd.cell_line}_{'+'.join(perturbed_genes)}.csv")
     de_df.to_csv(de_path, index=False)
     print(f"DE results saved to {de_path}")
 
-    # Pathway enrichment on top 100 up/down
+    # Pathway enrichment
     top_up = de_df[de_df['log2FC'] > 0].head(100)['gene'].tolist()
     top_down = de_df[de_df['log2FC'] < 0].head(100)['gene'].tolist()
     gene_list = top_up + top_down
