@@ -1,10 +1,9 @@
 # model.py
-
+# COMPLETE — WITH MULTI-GENE TOKEN SUPPORT FOR DOUBLE/TRIPLE KO
 
 import torch
 import torch.nn as nn
 import math
-
 
 class ConditionalVAE(nn.Module):
     def __init__(self, num_genes, num_conditions, latent_dim=128, hidden_dim=512):
@@ -20,7 +19,6 @@ class ConditionalVAE(nn.Module):
         )
         self.fc_mu = nn.Linear(hidden_dim // 2, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim // 2, latent_dim)
-
         self.decoder = nn.Sequential(
             nn.Linear(latent_dim + num_conditions, hidden_dim // 2),
             nn.BatchNorm1d(hidden_dim // 2),
@@ -49,7 +47,6 @@ class ConditionalVAE(nn.Module):
         z = self.reparameterize(mu, logvar)
         return self.decode(z, c), mu, logvar
 
-
 class TimestepEmbedding(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -63,7 +60,6 @@ class TimestepEmbedding(nn.Module):
         emb = t[:, None] * emb[None, :]
         return torch.cat((emb.sin(), emb.cos()), dim=1)
 
-
 class CrossAttentionBlock(nn.Module):
     def __init__(self, dim, num_heads, dropout=0.15):
         super().__init__()
@@ -75,7 +71,7 @@ class CrossAttentionBlock(nn.Module):
             nn.Linear(dim, dim * 4),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim * 4, dim)   # ← FIXED: "tapped" removed
+            nn.Linear(dim * 4, dim)
         )
         self.norm3 = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
@@ -88,7 +84,6 @@ class CrossAttentionBlock(nn.Module):
         ffn = self.ffn(x)
         x = self.norm3(x + self.dropout(ffn))
         return x
-
 
 class DiffusionModel(nn.Module):
     def __init__(
@@ -136,18 +131,24 @@ class DiffusionModel(nn.Module):
 
     def forward(self, x, t, cell_line_meta, pert_method_meta, pert_gene_embedding, gene_token_id, uncond_mask):
         B = x.shape[0]
-        x = self.input_proj(x).unsqueeze(1)           # (B, 1, H)
-        t_emb = self.time_proj(self.time_emb(t))      # (B, H)
+        x = self.input_proj(x).unsqueeze(1)  # (B, 1, H)
+        t_emb = self.time_proj(self.time_emb(t))  # (B, H)
 
         cl_emb = self.cell_line_proj(cell_line_meta)
         pm_emb = self.pert_method_proj(pert_method_meta)
         sig_emb = self.pert_gene_proj(pert_gene_embedding)
-        gene_tok_raw = self.gene_token_emb(gene_token_id)
-        gene_tok_emb = self.gene_token_proj(gene_tok_raw)
+
+        # MULTI-GENE TOKEN SUPPORT (NEW — for double KO)
+        if isinstance(gene_token_id, (list, tuple)):
+            # gene_token_id is list of IDs (e.g. [id_a, id_b])
+            gene_tok_emb = sum(self.gene_token_proj(self.gene_token_emb(torch.tensor([gid], device=self.device))) for gid in gene_token_id)
+        elif gene_token_id.dim() == 2:  # (B, num_genes)
+            gene_tok_emb = self.gene_token_proj(self.gene_token_emb(gene_token_id)).sum(dim=1)
+        else:
+            gene_tok_emb = self.gene_token_proj(self.gene_token_emb(gene_token_id))
 
         context_emb = cl_emb + pm_emb + sig_emb + gene_tok_emb
 
-        # Safe uncond_mask handling
         uncond_mask = uncond_mask.view(B, 1) * torch.ones_like(context_emb[:, :1])
         context_emb = context_emb * uncond_mask
 
